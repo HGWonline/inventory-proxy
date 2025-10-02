@@ -189,6 +189,7 @@ app.get("/auth/callback", async (req, res) => {
     }
 
     const accessToken = tokenJson.access_token;
+    console.warn("⚠️ TEMP TOKEN (remove after use):", accessToken);
 
     // ⚠️ 운영에서는 안전한 저장소(DB/비밀변수)에 저장하고 로그 출력은 제거하세요.
     console.log("✅ Admin API Access Token acquired.");
