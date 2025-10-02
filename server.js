@@ -8,13 +8,13 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ====== 공통 환경변수 ======
-const SHOP = process.env.SHOPIFY_SHOP;                 // 예: "your-shop.myshopify.com"
+const SHOP = process.env.SHOPIFY_SHOP;                 // 예: "binsprouts.myshopify.com"
 const API_VER = process.env.SHOPIFY_API_VER || "2024-10";
 
 // ----- OAuth용 (Partner 앱 자격증명) -----
 const API_KEY = process.env.SHOPIFY_API_KEY;           // Partner 앱 API key
 const API_SECRET = process.env.SHOPIFY_API_SECRET;     // Partner 앱 API secret
-const APP_URL = process.env.APP_URL;                   // 예: "https://inventory-proxy-xxxx.onrender.com"
+const APP_URL = process.env.APP_URL;                   // 예: "https://inventory-proxy-gfch.onrender.com"
 const REDIRECT_URI = `${APP_URL}/auth/callback`;
 const OAUTH_SCOPES = "read_products,read_inventory,read_locations";
 
@@ -33,6 +33,51 @@ const allowSet = new Set(ALLOWED_LOCATION_IDS);
 // 간단 메모리 캐시(서버가 유지되는 동안만, TTL=60초) - 선택
 const cache = new Map();
 const TTL_MS = 60 * 1000;
+
+// ====== 유틸: base64url ======
+function b64urlEncode(str) {
+  return Buffer.from(str, "utf8").toString("base64url");
+}
+function b64urlDecode(b64) {
+  return Buffer.from(b64, "base64url").toString("utf8");
+}
+
+// ====== 유틸: 무상태(state-less) state 토큰 ======
+// payload를 base64url로 인코딩하고, 그 값에 API_SECRET으로 HMAC 서명.
+// 콜백에서는 재계산으로 진위/유효시간/스토어 일치만 확인하면 됨.
+function createStateToken(shop) {
+  const payload = {
+    shop,
+    ts: Date.now(),
+    n: crypto.randomBytes(8).toString("hex"), // nonce
+  };
+  const payloadB64 = b64urlEncode(JSON.stringify(payload));
+  const sig = crypto.createHmac("sha256", API_SECRET).update(payloadB64).digest("hex");
+  return `${payloadB64}.${sig}`;
+}
+
+function verifyStateToken(token, expectedShop, maxAgeMs = 10 * 60 * 1000) {
+  const parts = `${token}`.split(".");
+  if (parts.length !== 2) return false;
+  const [payloadB64, sigHex] = parts;
+
+  const expectedSig = crypto.createHmac("sha256", API_SECRET).update(payloadB64).digest("hex");
+  const a = Buffer.from(expectedSig, "utf8");
+  const b = Buffer.from(sigHex, "utf8");
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+
+  let payload;
+  try {
+    payload = JSON.parse(b64urlDecode(payloadB64));
+  } catch {
+    return false;
+  }
+  if (!payload?.shop || !payload?.ts) return false;
+  if (expectedShop && payload.shop !== expectedShop) return false;
+  if (Date.now() - payload.ts > maxAgeMs) return false; // 만료
+
+  return true;
+}
 
 // ====== Admin GraphQL 공통 함수 ======
 async function adminGraphQL(query, variables = {}) {
@@ -72,7 +117,7 @@ const QUERY_ITEM_LEVELS = `
   }
 `;
 
-// ====== 유틸: Shopify HMAC 검증 ======
+// ====== 유틸: Shopify HMAC 검증 (쿼리 전체 기준) ======
 function verifyShopifyHmac(queryObj, apiSecret) {
   // hmac, signature 제외한 모든 쿼리 파라미터 사용
   const entries = Object.entries(queryObj)
@@ -83,23 +128,20 @@ function verifyShopifyHmac(queryObj, apiSecret) {
   const message = entries.join("&");
   const computed = crypto.createHmac("sha256", apiSecret).update(message).digest("hex");
 
-  // 안전 비교
   const a = Buffer.from(computed, "utf8");
   const b = Buffer.from(queryObj.hmac, "utf8");
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 // ====== OAuth: 설치 시작 (/auth/install?shop=...) ======
-const stateStore = new Map(); // 데모용. 운영은 KV/DB 권장.
-
 app.get("/auth/install", (req, res) => {
   try {
     const { shop } = req.query;
     if (!shop) return res.status(400).send("Missing shop");
     if (!API_KEY || !API_SECRET || !APP_URL) return res.status(500).send("OAuth env not configured");
 
-    const state = crypto.randomBytes(16).toString("hex");
-    stateStore.set(state, Date.now());
+    // 서버 저장 없이 검증 가능한 state 토큰 생성
+    const state = createStateToken(shop);
 
     const url = new URL(`https://${shop}/admin/oauth/authorize`);
     url.searchParams.set("client_id", API_KEY);
@@ -120,15 +162,17 @@ app.get("/auth/callback", async (req, res) => {
     const { shop, hmac, code, state } = req.query;
     if (!shop || !hmac || !code || !state) return res.status(400).send("Missing params");
 
-    // state 검증
-    if (!stateStore.has(state)) return res.status(400).send("Invalid state");
-
-    // HMAC 검증 (모든 파라미터 기준)
+    // 1) HMAC 검증 (Shopify 서명)
     if (!verifyShopifyHmac(req.query, API_SECRET)) {
       return res.status(400).send("Invalid HMAC");
     }
 
-    // 코드 → access_token 교환
+    // 2) state 토큰 검증(무상태) — 저장소 필요 없음
+    if (!verifyStateToken(state, shop)) {
+      return res.status(400).send("Invalid state");
+    }
+
+    // 3) 코드 → access_token 교환
     const tokenRes = await fetch(`https://${shop}/admin/oauth/access_token`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
