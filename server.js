@@ -72,6 +72,23 @@ const QUERY_ITEM_LEVELS = `
   }
 `;
 
+// ====== 유틸: Shopify HMAC 검증 ======
+function verifyShopifyHmac(queryObj, apiSecret) {
+  // hmac, signature 제외한 모든 쿼리 파라미터 사용
+  const entries = Object.entries(queryObj)
+    .filter(([k]) => k !== "hmac" && k !== "signature")
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([k, v]) => `${k}=${encodeURIComponent(Array.isArray(v) ? v.join(",") : `${v}`)}`);
+
+  const message = entries.join("&");
+  const computed = crypto.createHmac("sha256", apiSecret).update(message).digest("hex");
+
+  // 안전 비교
+  const a = Buffer.from(computed, "utf8");
+  const b = Buffer.from(queryObj.hmac, "utf8");
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 // ====== OAuth: 설치 시작 (/auth/install?shop=...) ======
 const stateStore = new Map(); // 데모용. 운영은 KV/DB 권장.
 
@@ -100,20 +117,16 @@ app.get("/auth/install", (req, res) => {
 // ====== OAuth: 콜백 (/auth/callback) ======
 app.get("/auth/callback", async (req, res) => {
   try {
-    const { shop, hmac, code, state, timestamp } = req.query;
+    const { shop, hmac, code, state } = req.query;
     if (!shop || !hmac || !code || !state) return res.status(400).send("Missing params");
 
     // state 검증
     if (!stateStore.has(state)) return res.status(400).send("Invalid state");
 
-    // HMAC 검증
-    const params = { shop, code, state, timestamp };
-    const message = Object.keys(params)
-      .sort()
-      .map((k) => `${k}=${params[k]}`)
-      .join("&");
-    const generated = crypto.createHmac("sha256", API_SECRET).update(message).digest("hex");
-    if (generated !== hmac) return res.status(400).send("Invalid HMAC");
+    // HMAC 검증 (모든 파라미터 기준)
+    if (!verifyShopifyHmac(req.query, API_SECRET)) {
+      return res.status(400).send("Invalid HMAC");
+    }
 
     // 코드 → access_token 교환
     const tokenRes = await fetch(`https://${shop}/admin/oauth/access_token`, {
@@ -133,11 +146,10 @@ app.get("/auth/callback", async (req, res) => {
 
     const accessToken = tokenJson.access_token;
 
-    // ⚠️ 운영에서는 안전한 저장소(DB/환경변수 관리)로 보관하고 로그를 남기지 마세요.
+    // ⚠️ 운영에서는 안전한 저장소(DB/비밀변수)에 저장하고 로그 출력은 제거하세요.
     console.log("✅ Admin API Access Token acquired.");
     ADMIN_TOKEN = accessToken; // 프로세스 메모리에 반영 (재배포 전 임시 사용)
 
-    // 안내문 (이후 Render 대시보드에 SHOPIFY_ADMIN_TOKEN으로 저장하고 재배포 권장)
     return res.send(
       "App installed! Access token acquired.<br/>" +
         "Copy this token from server logs and set it to SHOPIFY_ADMIN_TOKEN env, then redeploy.<br/>" +
