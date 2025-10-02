@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: inventory-proxy
+    env: node
+    plan: free
+    buildCommand: "npm install"
+    startCommand: "npm start"
+    autoDeploy: true
+    envVars:
+      - key: SHOPIFY_SHOP
+        sync: false
+      - key: SHOPIFY_ADMIN_TOKEN
+        sync: false
+      - key: SHOPIFY_API_VER
+        value: "2024-10"
+      - key: ALLOWED_LOCATION_IDS
+        sync: false
